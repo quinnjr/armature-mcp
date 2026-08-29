@@ -9,8 +9,11 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-29
+
 ### Fixed
 
+- **Every JSON-RPC POST failed to parse.** `McpController::handle_request` read the payload from the public `HttpRequest::body` field, but on `armature-core` `0.7` that `Vec<u8>` is *cleared* when the incoming body is stored zero-copy in the private `Bytes` slot (`set_body_bytes`), so any request off the wire reached the parser empty and came back `-32700 "EOF while parsing a value at line 1 column 0"` despite carrying a body. The body is now read through `body_ref()` — the `Bytes` view when set, the legacy `Vec` otherwise — which is correct on every `armature-core` version. The existing tests built their requests with `set_body` (the legacy path) and so never exercised the wire shape; a `post_request_from_wire` helper and regression test now cover it.
 - **Breaking:** `handle_request`/`handle_json` return `Option`, and the controller answers 204. The server replied to JSON-RPC notifications, which §4.1 forbids, so a conformant client sending `notifications/initialized` received a `-32601` error.
 - `prompts/list` and `prompts/get` are implemented. The server advertised the prompts capability whenever it was enabled and then answered both with method-not-found.
 - A malformed tool `input_schema` is surfaced rather than silently replaced with a permissive stand-in.
