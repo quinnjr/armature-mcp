@@ -62,9 +62,17 @@ impl McpController {
         // HeaderMap to a HashMap at this boundary.
         let headers: std::collections::HashMap<String, String> = req.headers.clone().into();
 
-        // Parsed straight out of the request's `Bytes` body: no UTF-8 copy
-        // and no intermediate `String` on the hot path.
-        match self.service.handle_bytes(&req.body, &headers).await {
+        // Read the body via `body_ref()`, not the public `body` field. When a
+        // request comes off the wire, armature-core stores it zero-copy in
+        // `HttpRequest`'s private `Bytes` slot and *clears* the legacy `body`
+        // Vec (see `set_body_bytes`), so `&req.body` is empty for every real
+        // request and only `body_ref()` returns the bytes. Reading `&req.body`
+        // here made every JSON-RPC POST parse an empty string and fail with
+        // `-32700 "EOF while parsing a value at line 1 column 0"`, even though
+        // the body was on the wire. `body_ref()` returns the `Bytes` view when
+        // set and falls back to the Vec otherwise, so it is correct for both
+        // wire requests and hand-built `HttpRequest`s (the tests below).
+        match self.service.handle_bytes(req.body_ref(), &headers).await {
             Some(response_json) => Ok(HttpResponse::ok()
                 .with_header("Content-Type".to_string(), "application/json".to_string())
                 .with_body(response_json.into_bytes())),
@@ -304,6 +312,52 @@ mod tests {
         let mut req = HttpRequest::new("POST", "/mcp".to_string());
         req.set_body(body.as_bytes().to_vec());
         req
+    }
+
+    /// Build a POST the way a request coming off the wire is built: the body
+    /// is stored via `set_body_bytes` (zero-copy `Bytes`). On armature-core
+    /// 0.7 this *cleared* the legacy `body` Vec, so a handler reading `&req.body`
+    /// saw an empty slice while `body_ref()` still returned the bytes — the
+    /// production regression. The original `post_request` used `set_body`,
+    /// which populates whatever the legacy path reads, so it never exercised
+    /// the wire shape. Reading through `body_ref()` is correct on every core
+    /// version; this helper pins the wire path regardless of how the current
+    /// core stores the body internally.
+    fn post_request_from_wire(body: &str) -> HttpRequest {
+        let mut req = HttpRequest::new("POST", "/mcp".to_string());
+        req.set_body_bytes(armature_core::Bytes::copy_from_slice(body.as_bytes()));
+        req
+    }
+
+    /// Regression: a JSON-RPC POST whose body is stored the wire way (zero-copy
+    /// `Bytes`, legacy Vec cleared) is parsed, not rejected as empty.
+    ///
+    /// Reading `&req.body` instead of `req.body_ref()` made every real POST
+    /// fail with `-32700 "EOF while parsing a value at line 1 column 0"` — the
+    /// parser was handed the emptied legacy Vec. This pins the fix.
+    #[tokio::test]
+    async fn wire_body_is_read_not_the_empty_legacy_vec() {
+        let controller = McpController::new();
+        let resp = controller
+            .handle_request(post_request_from_wire(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+            ))
+            .await
+            .expect("handle_request");
+        let json = body_json(&resp);
+        assert!(
+            json.get("error").is_none(),
+            "wire-shaped body must parse, got error: {json}"
+        );
+        assert_eq!(
+            json.get("id").and_then(|v| v.as_i64()),
+            Some(1),
+            "the initialize result echoes the request id: {json}"
+        );
+        assert!(
+            json.get("result").is_some(),
+            "initialize returns a result: {json}"
+        );
     }
 
     /// JSON-RPC 2.0 §4.1: a notification (no `id`) gets no reply. Over HTTP
