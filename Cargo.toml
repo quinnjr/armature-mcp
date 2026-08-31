@@ -1,26 +1,26 @@
 [package]
 name = "armature-mcp"
-version = "0.2.0"
-edition.workspace = true
+version = "0.3.1"
+edition = "2024"
 # Inherits the workspace MSRV (1.94.1). This crate's own floor is 1.91 — the
 # `register_mcp_tool!` macro expands to an `inventory::submit!` `static` whose
 # `McpToolEntry::new` must be `const fn`, needing `TypeId::of` in const context
 # (stable since Rust 1.91) — but the workspace floor is already higher, so no
 # per-crate override is needed.
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+rust-version = "1.94.1"
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-mcp"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Model Context Protocol (MCP) server support for Armature applications"
 keywords = ["mcp", "ai", "llm", "tools", "armature"]
 categories = ["web-programming", "development-tools"]
 
 [dependencies]
-armature-core = { path = "../armature-core", version = "0" }
-armature-http-client = { path = "../armature-http-client", version = "0" }
-armature-proc-macro = { path = "../armature-proc-macro", version = "0" }
-armature-jwt = { path = "../armature-jwt", version = "0" }
+armature-core = { version = "0.9" }
+armature-http-client = { version = "0.2" }
+armature-proc-macro = { version = "0.4" }
+armature-jwt = { version = "0.3" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
