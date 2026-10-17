@@ -19,7 +19,44 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// `resources/list` and `prompts/list` handlers.
 const LIST_PAGE_SIZE: usize = 100;
 
+/// Hosts accepted in the `Host` header by default: loopback only.
+const DEFAULT_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
 /// Configuration for the MCP service
+///
+/// There is no `Default`: authentication must be chosen explicitly with
+/// [`McpConfig::new`]. Use [`McpAuthConfig::insecure_none`] for local
+/// development without credentials.
+///
+/// # Origin and Host validation
+///
+/// The MCP Streamable HTTP transport requires servers to validate `Origin` to
+/// prevent DNS-rebinding attacks from browsers. The HTTP controller enforces:
+///
+/// - **`Origin`**: a request with no `Origin` header (non-browser clients) is
+///   allowed; a request whose `Origin` is not in
+///   [`allowed_origins`](Self::allowed_origins) is refused with `403`. The
+///   list is empty by default, so every cross-origin browser request is
+///   refused until origins are added with
+///   [`with_allowed_origins`](Self::with_allowed_origins).
+/// - **`Host`**: the host name (port ignored) must be in
+///   [`allowed_hosts`](Self::allowed_hosts), which defaults to `localhost`,
+///   `127.0.0.1` and `::1`. A server reachable under any other name must list
+///   it with [`with_allowed_hosts`](Self::with_allowed_hosts).
+///   [`allow_any_host`](Self::allow_any_host) disables the check (behind a
+///   reverse proxy that already validates `Host`).
+///
+/// ```
+/// use armature_mcp::{ApiTokenAuth, McpAuthConfig, McpConfig};
+///
+/// let config = McpConfig::new(McpAuthConfig::api_token(
+///     ApiTokenAuth::new().add_token_with_scopes("token", ["mcp:read"]),
+/// ))
+/// .with_server_info("my-app", "1.0.0")
+/// .with_allowed_hosts(["mcp.example.com"])
+/// .with_allowed_origins(["https://app.example.com"]);
+/// # let _ = config;
+/// ```
 #[derive(Clone)]
 pub struct McpConfig {
     /// Server name
@@ -34,6 +71,10 @@ pub struct McpConfig {
     pub enable_prompts: bool,
     /// Authentication configuration
     pub auth: McpAuthConfig,
+    /// Exact `Origin` values (`scheme://host[:port]`) browsers may call from.
+    pub allowed_origins: Vec<String>,
+    /// Host names accepted in the `Host` header (`None` = any host).
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for McpConfig {
@@ -44,31 +85,38 @@ impl std::fmt::Debug for McpConfig {
             .field("enable_tools", &self.enable_tools)
             .field("enable_resources", &self.enable_resources)
             .field("enable_prompts", &self.enable_prompts)
-            .field("auth", &"<auth_config>")
+            .field("auth", &self.auth)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("allowed_hosts", &self.allowed_hosts)
             .finish()
     }
 }
 
-impl Default for McpConfig {
-    fn default() -> Self {
+impl McpConfig {
+    /// Create a configuration with the given (required) authentication.
+    pub fn new(auth: McpAuthConfig) -> Self {
         Self {
             server_name: "armature-mcp".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             enable_tools: true,
             enable_resources: true,
             enable_prompts: false,
-            auth: McpAuthConfig::default(),
+            auth,
+            allowed_origins: Vec::new(),
+            allowed_hosts: Some(
+                DEFAULT_ALLOWED_HOSTS
+                    .iter()
+                    .map(|h| h.to_string())
+                    .collect(),
+            ),
         }
     }
-}
 
-impl McpConfig {
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        Self {
-            server_name: name.into(),
-            server_version: version.into(),
-            ..Default::default()
-        }
+    /// Set the server name and version reported by `initialize`.
+    pub fn with_server_info(mut self, name: impl Into<String>, version: impl Into<String>) -> Self {
+        self.server_name = name.into();
+        self.server_version = version.into();
+        self
     }
 
     pub fn with_tools(mut self, enabled: bool) -> Self {
@@ -91,6 +139,99 @@ impl McpConfig {
         self.auth = auth;
         self
     }
+
+    /// Browser origins (`scheme://host[:port]`, exact match) allowed to call
+    /// the endpoint. Replaces the current list.
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = origins
+            .into_iter()
+            .map(|o| o.into().trim_end_matches('/').to_ascii_lowercase())
+            .collect();
+        self
+    }
+
+    /// Host names (no port) accepted in the `Host` header. Replaces the
+    /// default loopback list.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = Some(
+            hosts
+                .into_iter()
+                .map(|h| {
+                    h.into()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_ascii_lowercase()
+                })
+                .collect(),
+        );
+        self
+    }
+
+    /// Accept any `Host` header. Only for deployments where a reverse proxy
+    /// already validates `Host`; this removes the DNS-rebinding defence.
+    pub fn allow_any_host(mut self) -> Self {
+        tracing::warn!("MCP Host-header validation disabled (allow_any_host)");
+        self.allowed_hosts = None;
+        self
+    }
+
+    /// Whether a request's `Origin` header value (if any) is allowed.
+    pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
+        match origin {
+            None => true,
+            Some(origin) => {
+                let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+                self.allowed_origins.contains(&origin)
+            }
+        }
+    }
+
+    /// Whether a request's `Host` header value (if any) is allowed. A missing
+    /// `Host` cannot come from a browser and is allowed.
+    pub fn host_allowed(&self, host: Option<&str>) -> bool {
+        let (Some(allowed), Some(host)) = (&self.allowed_hosts, host) else {
+            return true;
+        };
+        let Some(name) = host_name(host) else {
+            return false;
+        };
+        allowed.contains(&name)
+    }
+}
+
+/// Extract the lower-cased host name (without port or IPv6 brackets) from a
+/// `Host` header value. `None` when it is malformed.
+fn host_name(host: &str) -> Option<String> {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        let (name, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(is_port)) {
+            return None;
+        }
+        name
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if is_port(port) && !name.contains(':') => name,
+            Some(_) => return None,
+            None => host,
+        }
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+fn is_port(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// MCP service that handles protocol requests
@@ -166,23 +307,8 @@ macro_rules! dispatch_with_fallback {
 }
 
 impl McpService {
-    /// Create a new MCP service with default configuration
-    pub fn new() -> Self {
-        Self {
-            config: McpConfig::default(),
-            tool_registry: McpToolRegistry::new(),
-            resource_registry: McpResourceRegistry::new(),
-            prompt_registry: McpPromptRegistry::new(),
-            tool_providers: Vec::new(),
-            resource_providers: Vec::new(),
-            prompt_providers: Vec::new(),
-            merged_tools_cache: OnceLock::new(),
-            merged_resources_cache: OnceLock::new(),
-            merged_prompts_cache: OnceLock::new(),
-        }
-    }
-
-    /// Create a new MCP service with custom configuration
+    /// Create a new MCP service. Authentication is part of `config` and has
+    /// no default.
     pub fn with_config(config: McpConfig) -> Self {
         Self {
             config,
@@ -296,11 +422,6 @@ impl McpService {
         self.handle_bytes(json.as_bytes(), headers).await
     }
 
-    /// Handle a JSON request without authentication (for backwards compatibility)
-    pub async fn handle_json_unauthenticated(&self, json: &str) -> Option<String> {
-        self.handle_json(json, &HashMap::new()).await
-    }
-
     /// Dispatch a method call to the appropriate handler
     async fn dispatch_method(
         &self,
@@ -308,17 +429,18 @@ impl McpService {
         params: Option<Value>,
         headers: &HashMap<String, String>,
     ) -> Result<Value> {
-        // Authenticate the request
-        let _auth_context = authenticate(&self.config.auth, headers, method).await?;
+        // Authenticate the request, then authorize the specific tool /
+        // resource / prompt against the resulting context.
+        let auth_context = authenticate(&self.config.auth, headers, method).await?;
 
         match method {
             "initialize" => self.handle_initialize(params),
             "tools/list" => self.handle_tools_list(params),
-            "tools/call" => self.handle_tools_call(params).await,
+            "tools/call" => self.handle_tools_call(params, &auth_context).await,
             "resources/list" => self.handle_resources_list(params),
-            "resources/read" => self.handle_resources_read(params).await,
+            "resources/read" => self.handle_resources_read(params, &auth_context).await,
             "prompts/list" => self.handle_prompts_list(params),
-            "prompts/get" => self.handle_prompts_get(params).await,
+            "prompts/get" => self.handle_prompts_get(params, &auth_context).await,
             "ping" => Ok(serde_json::json!({})),
             // Handshake/lifecycle notifications every MCP client sends. They
             // carry no `id`, so `handle_request` discards this result; the
@@ -408,12 +530,17 @@ impl McpService {
     }
 
     /// Handle tools/call request
-    async fn handle_tools_call(&self, params: Option<Value>) -> Result<Value> {
+    async fn handle_tools_call(
+        &self,
+        params: Option<Value>,
+        auth: &McpAuthContext,
+    ) -> Result<Value> {
         let params: ToolCallParams = params
             .ok_or_else(|| McpError::InvalidParams("Missing params".to_string()))
             .and_then(|v| {
                 serde_json::from_value(v).map_err(|e| McpError::InvalidParams(e.to_string()))
             })?;
+        self.config.auth.authorize_tool(auth, &params.name)?;
 
         let result = match self
             .tool_registry
@@ -473,12 +600,17 @@ impl McpService {
     }
 
     /// Handle resources/read request
-    async fn handle_resources_read(&self, params: Option<Value>) -> Result<Value> {
+    async fn handle_resources_read(
+        &self,
+        params: Option<Value>,
+        auth: &McpAuthContext,
+    ) -> Result<Value> {
         let params: ResourceReadParams = params
             .ok_or_else(|| McpError::InvalidParams("Missing params".to_string()))
             .and_then(|v| {
                 serde_json::from_value(v).map_err(|e| McpError::InvalidParams(e.to_string()))
             })?;
+        self.config.auth.authorize_resource(auth, &params.uri)?;
 
         let content = match self.resource_registry.read_resource(&params.uri).await {
             Err(McpError::ResourceNotFound(_)) => {
@@ -538,12 +670,17 @@ impl McpService {
     }
 
     /// Handle prompts/get request
-    async fn handle_prompts_get(&self, params: Option<Value>) -> Result<Value> {
+    async fn handle_prompts_get(
+        &self,
+        params: Option<Value>,
+        auth: &McpAuthContext,
+    ) -> Result<Value> {
         let params: PromptGetParams = params
             .ok_or_else(|| McpError::InvalidParams("Missing params".to_string()))
             .and_then(|v| {
                 serde_json::from_value(v).map_err(|e| McpError::InvalidParams(e.to_string()))
             })?;
+        self.config.auth.authorize_prompt(auth, &params.name)?;
 
         let result = match self
             .prompt_registry
@@ -608,12 +745,6 @@ impl McpService {
     /// Get the configuration
     pub fn config(&self) -> &McpConfig {
         &self.config
-    }
-}
-
-impl Default for McpService {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -720,6 +851,10 @@ mod tests {
         HashMap::new()
     }
 
+    fn test_service() -> McpService {
+        McpService::with_config(McpConfig::new(McpAuthConfig::insecure_none()))
+    }
+
     /// Unwrap the response to a request that carries an `id`. `None` is only
     /// legal for notifications, so it is a test failure everywhere else.
     fn expect_response(response: Option<JsonRpcResponse>) -> JsonRpcResponse {
@@ -738,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_initialize() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("initialize");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -752,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_ping() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("ping");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -762,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tools_list() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("tools/list");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -778,7 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tools_list_with_cursor_param() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("tools/list")
             .with_params(serde_json::json!({ "cursor": "some_tool_name" }));
 
@@ -791,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_resources_list_with_cursor_param() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("resources/list")
             .with_params(serde_json::json!({ "cursor": "some_resource_uri" }));
 
@@ -824,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_unknown_method() {
-        let service = McpService::new();
+        let service = test_service();
         let request = JsonRpcRequest::new("unknown/method");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -835,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_json() {
-        let service = McpService::new();
+        let service = test_service();
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
 
         let response = service
@@ -848,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_invalid_json() {
-        let service = McpService::new();
+        let service = test_service();
         let json = "not valid json";
 
         let response = service
@@ -866,7 +1001,7 @@ mod tests {
     /// `-32601 Method not found`.
     #[tokio::test]
     async fn test_notification_produces_no_response_body() {
-        let service = McpService::new();
+        let service = test_service();
 
         assert!(
             service
@@ -894,7 +1029,7 @@ mod tests {
     /// `-32601`.
     #[tokio::test]
     async fn test_handshake_notifications_are_recognised_methods() {
-        let service = McpService::new();
+        let service = test_service();
 
         for method in ["notifications/initialized", "notifications/cancelled"] {
             let response = expect_response(
@@ -910,7 +1045,7 @@ mod tests {
     /// it must be reported as an invalid request, not a parse error.
     #[tokio::test]
     async fn test_batch_request_rejected_as_invalid_request() {
-        let service = McpService::new();
+        let service = test_service();
         let json = r#"  [{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
 
         let response = service
@@ -967,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_includes_registered_provider_tool() {
-        let service = McpService::new().with_tool_provider(Arc::new(EchoToolProvider));
+        let service = test_service().with_tool_provider(Arc::new(EchoToolProvider));
         let request = JsonRpcRequest::new("tools/list");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -979,7 +1114,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_call_dispatches_to_provider() {
-        let service = McpService::new().with_tool_provider(Arc::new(EchoToolProvider));
+        let service = test_service().with_tool_provider(Arc::new(EchoToolProvider));
         let request = JsonRpcRequest::new("tools/call")
             .with_params(serde_json::json!({ "name": "echo", "arguments": {"a": 1} }));
 
@@ -992,7 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_call_unknown_name_returns_tool_not_found_error() {
-        let service = McpService::new().with_tool_provider(Arc::new(EchoToolProvider));
+        let service = test_service().with_tool_provider(Arc::new(EchoToolProvider));
         let request = JsonRpcRequest::new("tools/call")
             .with_params(serde_json::json!({ "name": "does_not_exist", "arguments": {} }));
 
@@ -1004,7 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resources_list_includes_registered_provider_resource() {
-        let service = McpService::new().with_resource_provider(Arc::new(EchoResourceProvider));
+        let service = test_service().with_resource_provider(Arc::new(EchoResourceProvider));
         let request = JsonRpcRequest::new("resources/list");
 
         let response = expect_response(service.handle_request(request, &empty_headers()).await);
@@ -1016,7 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resources_read_dispatches_to_provider() {
-        let service = McpService::new().with_resource_provider(Arc::new(EchoResourceProvider));
+        let service = test_service().with_resource_provider(Arc::new(EchoResourceProvider));
         let request = JsonRpcRequest::new("resources/read")
             .with_params(serde_json::json!({ "uri": "echo://resource" }));
 
@@ -1082,7 +1217,7 @@ mod tests {
         // logic (`merge_dedup_sorted`) must keep exactly one entry for the
         // name, and — matching registry-vs-provider precedence — the
         // first-registered provider's definition wins over later ones.
-        let service = McpService::new()
+        let service = test_service()
             .with_tool_provider(Arc::new(NamedEchoToolProvider {
                 name: "shared",
                 reply: "first",
@@ -1109,7 +1244,7 @@ mod tests {
         // at the same URI; the merged `resources/list` must contain exactly
         // one entry, with the first-registered provider's definition
         // winning.
-        let service = McpService::new()
+        let service = test_service()
             .with_resource_provider(Arc::new(NamedEchoResourceProvider {
                 uri: "shared://resource",
                 reply: "first",
@@ -1168,7 +1303,7 @@ mod tests {
     /// dispatch arms at all and answered `-32601`.
     #[tokio::test]
     async fn test_prompts_list_and_get_are_served() {
-        let service = McpService::new().with_prompt_provider(Arc::new(GreetingPromptProvider));
+        let service = test_service().with_prompt_provider(Arc::new(GreetingPromptProvider));
 
         let response = expect_response(
             service
@@ -1190,7 +1325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompts_get_unknown_name_returns_prompt_not_found_error() {
-        let service = McpService::new().with_prompt_provider(Arc::new(GreetingPromptProvider));
+        let service = test_service().with_prompt_provider(Arc::new(GreetingPromptProvider));
         let request = JsonRpcRequest::new("prompts/get")
             .with_params(serde_json::json!({ "name": "does_not_exist" }));
 
@@ -1204,7 +1339,7 @@ mod tests {
     /// them; the flag drives that, and both list/get are wired up above.
     #[tokio::test]
     async fn test_initialize_advertises_prompts_only_when_enabled() {
-        let disabled = McpService::new();
+        let disabled = test_service();
         let response = expect_response(
             disabled
                 .handle_request(JsonRpcRequest::new("initialize"), &empty_headers())
@@ -1213,7 +1348,9 @@ mod tests {
         let result: InitializeResult = serde_json::from_value(response.result.unwrap()).unwrap();
         assert!(result.capabilities.prompts.is_none());
 
-        let enabled = McpService::with_config(McpConfig::default().with_prompts(true));
+        let enabled = McpService::with_config(
+            McpConfig::new(McpAuthConfig::insecure_none()).with_prompts(true),
+        );
         let response = expect_response(
             enabled
                 .handle_request(JsonRpcRequest::new("initialize"), &empty_headers())
@@ -1225,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resources_read_unknown_uri_returns_resource_not_found_error() {
-        let service = McpService::new().with_resource_provider(Arc::new(EchoResourceProvider));
+        let service = test_service().with_resource_provider(Arc::new(EchoResourceProvider));
         let request = JsonRpcRequest::new("resources/read")
             .with_params(serde_json::json!({ "uri": "does://not-exist" }));
 
@@ -1233,5 +1370,90 @@ mod tests {
 
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32002);
+    }
+
+    /// H13: the auth context used to be discarded (`let _auth_context`), so
+    /// per-item scopes could never be enforced. A token without the scope a
+    /// tool / resource / prompt requires must be refused with -32003, and one
+    /// holding it must get through.
+    #[tokio::test]
+    async fn scopes_enforced_on_tools_resources_prompts() {
+        use crate::auth::ApiTokenAuth;
+
+        let auth = McpAuthConfig::api_token(
+            ApiTokenAuth::new()
+                .add_token_with_scopes("reader", ["mcp:read"])
+                .add_token_with_scopes("admin", ["mcp:read", "mcp:admin"]),
+        )
+        .require_tool_scopes("echo", ["mcp:admin"])
+        .require_resource_scopes("echo://resource", ["mcp:admin"])
+        .require_prompt_scopes("greeting", ["mcp:admin"]);
+        let service = McpService::with_config(McpConfig::new(auth).with_prompts(true))
+            .with_tool_provider(Arc::new(EchoToolProvider))
+            .with_resource_provider(Arc::new(EchoResourceProvider))
+            .with_prompt_provider(Arc::new(GreetingPromptProvider));
+
+        let headers = |tok: &str| {
+            let mut h = HashMap::new();
+            h.insert("Authorization".to_string(), format!("Bearer {tok}"));
+            h
+        };
+        let calls = [
+            JsonRpcRequest::new("tools/call")
+                .with_params(serde_json::json!({ "name": "echo", "arguments": {} })),
+            JsonRpcRequest::new("resources/read")
+                .with_params(serde_json::json!({ "uri": "echo://resource" })),
+            JsonRpcRequest::new("prompts/get")
+                .with_params(serde_json::json!({ "name": "greeting", "arguments": {"who": "x"} })),
+        ];
+
+        for call in calls {
+            let denied = expect_response(
+                service
+                    .handle_request(call.clone(), &headers("reader"))
+                    .await,
+            );
+            let err = denied.error.expect("reader must be refused");
+            assert_eq!(err.code, -32003, "{}", call.method);
+
+            let allowed = expect_response(
+                service
+                    .handle_request(call.clone(), &headers("admin"))
+                    .await,
+            );
+            assert!(
+                allowed.error.is_none(),
+                "{}: {:?}",
+                call.method,
+                allowed.error
+            );
+        }
+    }
+
+    #[test]
+    fn host_and_origin_validation() {
+        let config = McpConfig::new(McpAuthConfig::insecure_none());
+        // Host: loopback by default, port ignored, missing allowed.
+        assert!(config.host_allowed(None));
+        assert!(config.host_allowed(Some("localhost:3000")));
+        assert!(config.host_allowed(Some("127.0.0.1")));
+        assert!(config.host_allowed(Some("[::1]:8080")));
+        assert!(!config.host_allowed(Some("evil.example:3000")));
+        assert!(!config.host_allowed(Some("localhost.evil.example")));
+        assert!(!config.host_allowed(Some("localhost:abc")));
+        // Origin: absent allowed, any present origin refused by default.
+        assert!(config.origin_allowed(None));
+        assert!(!config.origin_allowed(Some("http://localhost:3000")));
+        assert!(!config.origin_allowed(Some("null")));
+
+        let config = config
+            .with_allowed_hosts(["MCP.example.com"])
+            .with_allowed_origins(["https://App.example.com/"]);
+        assert!(config.host_allowed(Some("mcp.example.com:443")));
+        assert!(!config.host_allowed(Some("localhost")));
+        assert!(config.origin_allowed(Some("https://app.example.com")));
+        assert!(!config.origin_allowed(Some("https://app.example.com.evil")));
+
+        assert!(config.allow_any_host().host_allowed(Some("anything")));
     }
 }

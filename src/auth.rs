@@ -4,10 +4,21 @@
 //! - API tokens (generated bearer tokens)
 //! - JWT validation
 //! - OAuth2 access tokens
+//!
+//! There is deliberately no default: every [`McpAuthConfig`] names its
+//! authentication method explicitly. Running without authentication requires
+//! the loudly-named [`McpAuthConfig::insecure_none`], which logs a warning.
+//!
+//! Authorization is per tool / resource / prompt: register the scopes a caller
+//! must hold with [`McpAuthConfig::require_tool_scopes`],
+//! [`McpAuthConfig::require_resource_scopes`] and
+//! [`McpAuthConfig::require_prompt_scopes`]. The service checks them against
+//! the authenticated [`McpAuthContext`] before dispatching.
 
 use crate::error::{McpError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,12 +33,29 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     armature_core::crypto::constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
+/// SHA-256 of a bearer token. Used as the OAuth2 validation-cache key and as
+/// the source of API-token fingerprints, so raw tokens are never retained or
+/// echoed.
+fn sha256_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Short, non-reversible fingerprint of a token (first 8 bytes of its SHA-256,
+/// hex) suitable for identifying a caller in logs and the auth context.
+fn token_fingerprint(token: &str) -> String {
+    sha256_token(token)[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Authentication method for MCP access
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum McpAuthMethod {
-    /// No authentication required (not recommended for production)
-    None,
+    /// No authentication at all. Only for local development; construct it via
+    /// [`McpAuthConfig::insecure_none`], which logs a warning.
+    InsecureNone,
 
     /// Static API tokens - simple bearer tokens validated against a list
     ApiToken(ApiTokenAuth),
@@ -45,10 +73,22 @@ pub enum McpAuthMethod {
     Custom(Arc<dyn McpAuthenticator>),
 }
 
+impl McpAuthMethod {
+    /// Whether this method (or any alternative inside an `AnyOf`) accepts
+    /// unauthenticated requests.
+    fn is_insecure(&self) -> bool {
+        match self {
+            Self::InsecureNone => true,
+            Self::AnyOf(methods) => methods.iter().any(Self::is_insecure),
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for McpAuthMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::None => write!(f, "None"),
+            Self::InsecureNone => write!(f, "InsecureNone"),
             Self::ApiToken(a) => f.debug_tuple("ApiToken").field(a).finish(),
             Self::Jwt(a) => f.debug_tuple("Jwt").field(a).finish(),
             Self::OAuth2(a) => f.debug_tuple("OAuth2").field(a).finish(),
@@ -59,7 +99,15 @@ impl std::fmt::Debug for McpAuthMethod {
 }
 
 /// API token authentication configuration
-#[derive(Debug, Clone)]
+///
+/// Tokens grant only the scopes they are configured with — the scopes passed
+/// to [`with_granted_scopes`](Self::with_granted_scopes) for every token, or
+/// per-token scopes from [`add_token_with_scopes`](Self::add_token_with_scopes).
+/// A token configured with no scopes can call only tools/resources/prompts
+/// that require none.
+///
+/// `Debug` redacts the tokens.
+#[derive(Clone)]
 pub struct ApiTokenAuth {
     /// Valid API tokens
     pub tokens: HashSet<String>,
@@ -67,8 +115,29 @@ pub struct ApiTokenAuth {
     pub header_name: String,
     /// Token prefix (default: "Bearer ")
     pub token_prefix: String,
-    /// Required scopes (empty = no scope check)
+    /// Scopes a token must hold to authenticate at all (empty = no check)
     pub required_scopes: Vec<String>,
+    /// Scopes granted to every token without a per-token entry in
+    /// `token_scopes` (default: none)
+    pub granted_scopes: Vec<String>,
+    /// Per-token granted scopes, overriding `granted_scopes`
+    pub token_scopes: HashMap<String, Vec<String>>,
+}
+
+impl std::fmt::Debug for ApiTokenAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiTokenAuth")
+            .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
+            .field("header_name", &self.header_name)
+            .field("token_prefix", &self.token_prefix)
+            .field("required_scopes", &self.required_scopes)
+            .field("granted_scopes", &self.granted_scopes)
+            .field(
+                "token_scopes",
+                &format_args!("<{} redacted>", self.token_scopes.len()),
+            )
+            .finish()
+    }
 }
 
 impl Default for ApiTokenAuth {
@@ -78,6 +147,8 @@ impl Default for ApiTokenAuth {
             header_name: "Authorization".to_string(),
             token_prefix: "Bearer ".to_string(),
             required_scopes: Vec::new(),
+            granted_scopes: Vec::new(),
+            token_scopes: HashMap::new(),
         }
     }
 }
@@ -101,6 +172,30 @@ impl ApiTokenAuth {
         self
     }
 
+    /// Add a token that is granted exactly `scopes` (overriding
+    /// [`granted_scopes`](Self::granted_scopes)).
+    pub fn add_token_with_scopes<I, S>(mut self, token: impl Into<String>, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let token = token.into();
+        self.token_scopes
+            .insert(token.clone(), scopes.into_iter().map(Into::into).collect());
+        self.tokens.insert(token);
+        self
+    }
+
+    /// Scopes granted to every token that has no per-token scopes.
+    pub fn with_granted_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.granted_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn with_header(mut self, header: impl Into<String>) -> Self {
         self.header_name = header.into();
         self
@@ -111,6 +206,7 @@ impl ApiTokenAuth {
         self
     }
 
+    /// Scopes a token must be granted for authentication to succeed.
     pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -229,7 +325,11 @@ type CachedValidation = (McpAuthContext, Instant);
 const OAUTH2_CACHE_MAX_ENTRIES: usize = 4096;
 
 /// OAuth2 authentication configuration
-#[derive(Debug, Clone)]
+///
+/// The validation client never follows redirects and ignores the ambient
+/// `HTTP_PROXY`/`HTTPS_PROXY` environment; a proxy is used only when set with
+/// [`with_proxy`](Self::with_proxy). `Debug` redacts the client secret.
+#[derive(Clone)]
 pub struct OAuth2Auth {
     /// Token introspection endpoint URL
     pub introspection_url: Option<String>,
@@ -241,17 +341,40 @@ pub struct OAuth2Auth {
     pub client_secret: Option<String>,
     /// Required scopes
     pub required_scopes: Vec<String>,
-    /// Cache validated tokens (TTL in seconds)
+    /// Cache validated tokens (TTL in seconds). An entry never outlives the
+    /// token's own `exp` when the endpoint reports one.
     pub cache_ttl: Option<u64>,
-    /// In-memory cache of successful token validations, keyed by a hash of the
-    /// bearer token (raw tokens are never stored). Shared across clones — and
-    /// therefore across requests, since the config is cloned/held by the
+    /// Explicit proxy URL for validation requests (default: none, and the
+    /// environment's proxy variables are ignored)
+    pub proxy: Option<String>,
+    /// In-memory cache of successful token validations, keyed by the SHA-256
+    /// of the bearer token (raw tokens are never stored). Shared across clones
+    /// — and therefore across requests, since the config is cloned/held by the
     /// long-lived service — via `Arc`. Only populated when `cache_ttl` is
     /// `Some`; only successes are cached (fail-closed).
     ///
     /// This is a private field, so `OAuth2Auth` can no longer be constructed
     /// with a struct literal; use `OAuth2Auth::new()` / the builder methods.
-    cache: Arc<Mutex<HashMap<u64, CachedValidation>>>,
+    cache: Arc<Mutex<HashMap<[u8; 32], CachedValidation>>>,
+    /// Lazily-built validation client (no redirects, no ambient proxy).
+    http_client: Arc<OnceLock<reqwest::Client>>,
+}
+
+impl std::fmt::Debug for OAuth2Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2Auth")
+            .field("introspection_url", &self.introspection_url)
+            .field("user_info_url", &self.user_info_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("required_scopes", &self.required_scopes)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for OAuth2Auth {
@@ -262,8 +385,10 @@ impl Default for OAuth2Auth {
             client_id: None,
             client_secret: None,
             required_scopes: Vec::new(),
-            cache_ttl: Some(300), // 5 minutes default
+            cache_ttl: Some(300), // 5 minutes default, capped by token `exp`
+            proxy: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            http_client: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -309,6 +434,40 @@ impl OAuth2Auth {
         self
     }
 
+    /// Route validation requests through this proxy. Without it no proxy is
+    /// used, whatever `HTTP_PROXY`/`HTTPS_PROXY` say.
+    pub fn with_proxy(mut self, proxy_url: impl Into<String>) -> Self {
+        self.proxy = Some(proxy_url.into());
+        self.http_client = Arc::new(OnceLock::new());
+        self
+    }
+
+    /// The validation HTTP client: no redirects (a redirect could carry the
+    /// bearer token or client credentials to another host), no ambient proxy,
+    /// fixed timeout.
+    fn client(&self) -> Result<&reqwest::Client> {
+        if let Some(client) = self.http_client.get() {
+            return Ok(client);
+        }
+        let mut builder = reqwest::Client::builder()
+            .timeout(OAUTH2_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if let Some(proxy) = &self.proxy {
+            let proxy = reqwest::Proxy::all(proxy)
+                .map_err(|_| McpError::Internal("invalid OAuth2 proxy URL".into()))?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| McpError::Internal(format!("failed to build OAuth2 client: {e}")))?;
+        let _ = self.http_client.set(client);
+        Ok(self
+            .http_client
+            .get()
+            .expect("http_client was just set or already initialized"))
+    }
+
     /// Look up a previously validated token in the cache.
     ///
     /// Returns the cached context only when caching is enabled (`cache_ttl` is
@@ -317,7 +476,7 @@ impl OAuth2Auth {
     /// tokens.
     fn cache_lookup(&self, token: &str) -> Option<McpAuthContext> {
         self.cache_ttl?; // caching disabled -> always a miss
-        let key = hash_token(token);
+        let key = sha256_token(token);
         let now = Instant::now();
         let mut map = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         // Opportunistic eviction of everything that has expired.
@@ -326,15 +485,23 @@ impl OAuth2Auth {
     }
 
     /// Store a successful validation in the cache with an expiry of
-    /// `now + cache_ttl`. No-op when caching is disabled. Enforces a size cap
-    /// so the cache cannot grow without bound.
-    fn cache_store(&self, token: &str, ctx: &McpAuthContext) {
+    /// `now + min(cache_ttl, token lifetime)`. No-op when caching is disabled
+    /// or the token has no remaining lifetime. Enforces a size cap so the
+    /// cache cannot grow without bound.
+    fn cache_store(&self, token: &str, ctx: &McpAuthContext, token_lifetime: Option<Duration>) {
         let Some(ttl) = self.cache_ttl else {
             return;
         };
-        let key = hash_token(token);
+        let mut ttl = Duration::from_secs(ttl);
+        if let Some(lifetime) = token_lifetime {
+            ttl = ttl.min(lifetime);
+        }
+        if ttl.is_zero() {
+            return;
+        }
+        let key = sha256_token(token);
         let now = Instant::now();
-        let expiry = now + Duration::from_secs(ttl);
+        let expiry = now + ttl;
         let mut map = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         if map.len() >= OAUTH2_CACHE_MAX_ENTRIES {
@@ -352,15 +519,6 @@ impl OAuth2Auth {
     }
 }
 
-/// Hash a bearer token to a compact cache key so raw tokens are not retained
-/// in the cache map. A non-cryptographic hash is sufficient for a lookup key.
-fn hash_token(token: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Authenticated user/client information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpAuthContext {
@@ -375,6 +533,7 @@ pub struct McpAuthContext {
 }
 
 impl Default for McpAuthContext {
+    /// The anonymous context: no subject, no scopes.
     fn default() -> Self {
         Self {
             subject: None,
@@ -409,8 +568,24 @@ pub trait McpAuthenticator: Send + Sync {
     ) -> Result<McpAuthContext>;
 }
 
-/// MCP authentication configuration
-#[derive(Clone)]
+/// MCP authentication and authorization configuration
+///
+/// There is no `Default`: pick a method with one of the constructors. For
+/// local development without credentials use [`insecure_none`](Self::insecure_none).
+///
+/// ```
+/// use armature_mcp::{ApiTokenAuth, McpAuthConfig};
+///
+/// let auth = McpAuthConfig::api_token(
+///     ApiTokenAuth::new()
+///         .add_token_with_scopes("reader-token", ["mcp:read"])
+///         .add_token_with_scopes("admin-token", ["mcp:read", "mcp:admin"]),
+/// )
+/// .require_tool_scopes("delete_user", ["mcp:admin"])
+/// .require_resource_scopes("file:///etc/app.toml", ["mcp:read"]);
+/// # let _ = auth;
+/// ```
+#[derive(Clone, Debug)]
 pub struct McpAuthConfig {
     /// Authentication method
     pub method: McpAuthMethod,
@@ -418,29 +593,38 @@ pub struct McpAuthConfig {
     pub allow_list_unauthenticated: bool,
     /// Allow unauthenticated access to ping/initialize
     pub allow_init_unauthenticated: bool,
-}
-
-impl Default for McpAuthConfig {
-    fn default() -> Self {
-        Self {
-            method: McpAuthMethod::None,
-            allow_list_unauthenticated: false,
-            allow_init_unauthenticated: true,
-        }
-    }
+    /// Scopes required to call each tool, by tool name
+    pub tool_scopes: HashMap<String, Vec<String>>,
+    /// Scopes required to read each resource, by URI
+    pub resource_scopes: HashMap<String, Vec<String>>,
+    /// Scopes required to get each prompt, by prompt name
+    pub prompt_scopes: HashMap<String, Vec<String>>,
 }
 
 impl McpAuthConfig {
     pub fn new(method: McpAuthMethod) -> Self {
+        if method.is_insecure() {
+            tracing::warn!(
+                "MCP authentication is disabled (McpAuthMethod::InsecureNone): any client \
+                 that can reach the endpoint can call every tool. Do not use in production."
+            );
+        }
         Self {
             method,
-            ..Default::default()
+            allow_list_unauthenticated: false,
+            allow_init_unauthenticated: true,
+            tool_scopes: HashMap::new(),
+            resource_scopes: HashMap::new(),
+            prompt_scopes: HashMap::new(),
         }
     }
 
-    /// No authentication required
-    pub fn none() -> Self {
-        Self::new(McpAuthMethod::None)
+    /// No authentication at all. **Local development only** — logs a warning.
+    ///
+    /// Callers get an anonymous context with no scopes, so any tool, resource
+    /// or prompt that has required scopes is still refused.
+    pub fn insecure_none() -> Self {
+        Self::new(McpAuthMethod::InsecureNone)
     }
 
     /// API token authentication
@@ -477,6 +661,68 @@ impl McpAuthConfig {
         self.allow_init_unauthenticated = allow;
         self
     }
+
+    /// Require the caller to hold all of `scopes` to call tool `name`.
+    pub fn require_tool_scopes<I, S>(mut self, name: impl Into<String>, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tool_scopes
+            .insert(name.into(), scopes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Require the caller to hold all of `scopes` to read resource `uri`.
+    pub fn require_resource_scopes<I, S>(mut self, uri: impl Into<String>, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.resource_scopes
+            .insert(uri.into(), scopes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Require the caller to hold all of `scopes` to get prompt `name`.
+    pub fn require_prompt_scopes<I, S>(mut self, name: impl Into<String>, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.prompt_scopes
+            .insert(name.into(), scopes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Check that `ctx` may call tool `name`.
+    pub fn authorize_tool(&self, ctx: &McpAuthContext, name: &str) -> Result<()> {
+        authorize_scopes(self.tool_scopes.get(name), ctx, "tool", name)
+    }
+
+    /// Check that `ctx` may read resource `uri`.
+    pub fn authorize_resource(&self, ctx: &McpAuthContext, uri: &str) -> Result<()> {
+        authorize_scopes(self.resource_scopes.get(uri), ctx, "resource", uri)
+    }
+
+    /// Check that `ctx` may get prompt `name`.
+    pub fn authorize_prompt(&self, ctx: &McpAuthContext, name: &str) -> Result<()> {
+        authorize_scopes(self.prompt_scopes.get(name), ctx, "prompt", name)
+    }
+}
+
+fn authorize_scopes(
+    required: Option<&Vec<String>>,
+    ctx: &McpAuthContext,
+    kind: &str,
+    name: &str,
+) -> Result<()> {
+    match required {
+        Some(required) if !ctx.has_all_scopes(required) => Err(McpError::Forbidden(format!(
+            "insufficient scope for {kind} '{name}'"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Authenticate a request using the configured method
@@ -505,7 +751,7 @@ fn authenticate_with_method<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<McpAuthContext>> + Send + 'a>> {
     Box::pin(async move {
         match method {
-            McpAuthMethod::None => Ok(McpAuthContext::default()),
+            McpAuthMethod::InsecureNone => Ok(McpAuthContext::default()),
 
             McpAuthMethod::ApiToken(auth) => authenticate_api_token(auth, headers).await,
 
@@ -566,29 +812,36 @@ async fn authenticate_api_token(
     //
     // NOTE: `auth.tokens` has no upper-bound enforcement here. Per-request
     // cost is O(n) in the configured token-list size (every token is
-    // compared, unconditionally, with no early exit), so an operator who
-    // configures an unusually large token list turns each authentication
-    // attempt into a proportionally larger amount of work - a potential
-    // DoS-amplification vector if the list size is attacker-influenced or
-    // grows unbounded. This crate has no logging/metrics dependency
-    // available here to emit a runtime warning when the list exceeds a
-    // threshold (e.g. 1000 tokens); callers that configure `ApiTokenAuth`
-    // from an external or growing source should apply their own sanity
-    // limit on `tokens.len()` before constructing it.
-    let token_valid = auth.tokens.iter().fold(false, |matched, valid| {
-        matched | constant_time_eq(valid, token)
-    });
+    // compared, unconditionally, with no early exit), so callers that
+    // configure `ApiTokenAuth` from an external or growing source should
+    // apply their own sanity limit on `tokens.len()` before constructing it.
+    let mut matched: Option<&String> = None;
+    for valid in &auth.tokens {
+        if constant_time_eq(valid, token) {
+            matched = Some(valid);
+        }
+    }
 
-    if !token_valid {
+    let Some(matched) = matched else {
         return Err(McpError::InvalidRequest("Invalid API token".into()));
+    };
+
+    // Grant exactly the configured scopes — never an implicit wildcard.
+    let scopes = auth
+        .token_scopes
+        .get(matched)
+        .unwrap_or(&auth.granted_scopes)
+        .clone();
+
+    if !auth.required_scopes.iter().all(|s| scopes.contains(s)) {
+        return Err(McpError::InvalidRequest("Insufficient scopes".into()));
     }
 
     Ok(McpAuthContext {
-        subject: Some(format!(
-            "api-token:{}",
-            token.chars().take(8).collect::<String>()
-        )),
-        scopes: vec!["*".to_string()], // API tokens get all scopes by default
+        // A fingerprint, not a prefix of the token: the subject ends up in
+        // logs and handlers, and a token prefix is secret material.
+        subject: Some(format!("api-token:{}", token_fingerprint(token))),
+        scopes,
         claims: serde_json::Value::Null,
         auth_method: "api_token".to_string(),
     })
@@ -617,16 +870,16 @@ fn get_or_build_jwt_manager(auth: &JwtAuth) -> Result<&armature_jwt::JwtManager>
             let secret = auth.secret.clone().ok_or_else(|| {
                 McpError::InvalidRequest("JWT auth is missing a configured secret".into())
             })?;
-            armature_jwt::JwtConfig::new(secret).with_algorithm(algorithm)
+            armature_jwt::JwtConfig::new(secret)
+                .map_err(|e| McpError::InvalidRequest(format!("Invalid JWT secret: {e}")))?
+                .with_algorithm(algorithm)
         }
         _ => {
             let public_key = auth.public_key.clone().ok_or_else(|| {
                 McpError::InvalidRequest("JWT auth is missing a configured public key".into())
             })?;
-            let mut config = armature_jwt::JwtConfig::new(String::new()).with_algorithm(algorithm);
-            config.secret = None;
-            config.public_key = Some(public_key);
-            config
+            // Verify-only: no private key is needed (or held).
+            armature_jwt::JwtConfig::with_key_pair(String::new(), public_key, algorithm)
         }
     };
 
@@ -686,8 +939,10 @@ async fn authenticate_jwt(
     // on every single request.
     let manager = get_or_build_jwt_manager(auth)?;
 
+    // `verify_access` (not `verify`): a refresh token minted by the same
+    // issuer must not authenticate a request.
     let claims: serde_json::Value = manager
-        .verify(token)
+        .verify_access(token)
         .map_err(|e| McpError::InvalidRequest(format!("JWT verification failed: {e}")))?;
 
     // Extract subject
@@ -779,25 +1034,63 @@ async fn authenticate_oauth2(
     };
 
     // Cache only on success; failures above short-circuit via `?` and are
-    // never cached, so an invalid token is never served from cache.
-    auth.cache_store(token, &ctx);
+    // never cached, so an invalid token is never served from cache. The entry
+    // never outlives the token's own `exp`.
+    let lifetime = remaining_token_lifetime(&ctx.claims)?;
+    auth.cache_store(token, &ctx, lifetime);
     Ok(ctx)
 }
 
-/// Timeout applied to OAuth2 validation requests (fail closed on expiry).
-const OAUTH2_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Seconds since the Unix epoch.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
-/// Shared HTTP client for OAuth2 validation requests.
-fn oauth2_http_client() -> &'static armature_http_client::HttpClient {
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<armature_http_client::HttpClient> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        armature_http_client::HttpClient::new(
-            armature_http_client::HttpClientConfig::builder()
-                .timeout(OAUTH2_HTTP_TIMEOUT)
-                .build(),
-        )
-    })
+/// Remaining lifetime of a token whose validation response carries an `exp`
+/// claim, `None` when it carries none. A token already past `exp` is rejected.
+fn remaining_token_lifetime(claims: &serde_json::Value) -> Result<Option<Duration>> {
+    let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) else {
+        return Ok(None);
+    };
+    let remaining = exp - unix_now();
+    if remaining <= 0 {
+        return Err(McpError::InvalidRequest("OAuth2 token has expired".into()));
+    }
+    Ok(Some(Duration::from_secs(remaining as u64)))
+}
+
+/// Timeout applied to OAuth2 validation requests (fail closed on expiry).
+const OAUTH2_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on an introspection / user-info response body.
+const OAUTH2_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Read a validation response body as JSON, refusing bodies larger than
+/// [`OAUTH2_MAX_RESPONSE_BYTES`].
+async fn read_json_capped(mut response: reqwest::Response) -> Result<serde_json::Value> {
+    let too_large = || McpError::InvalidRequest("OAuth2 validation response too large".into());
+    if response
+        .content_length()
+        .is_some_and(|len| len > OAUTH2_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| McpError::InvalidRequest("Failed to read OAuth2 validation response".into()))?
+    {
+        if body.len() + chunk.len() > OAUTH2_MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| McpError::InvalidRequest("Invalid OAuth2 validation response body".into()))
 }
 
 /// Enforce the configured required scopes against the scopes granted to the
@@ -820,29 +1113,28 @@ fn check_required_scopes(auth: &OAuth2Auth, scopes: &[String]) -> Result<()> {
 ///
 /// A `200 OK` response means the token is valid; the JSON body is used to
 /// extract the subject (`sub`) and any advertised scopes. Any transport
-/// error, timeout, or non-success status fails closed.
+/// error, timeout, redirect, or non-success status fails closed.
 async fn validate_oauth2_via_userinfo(
     url: &str,
     token: &str,
     auth: &OAuth2Auth,
 ) -> Result<McpAuthContext> {
-    let response = oauth2_http_client()
+    let response = auth
+        .client()?
         .get(url)
         .bearer_auth(token)
         .send()
         .await
         .map_err(|e| McpError::InvalidRequest(format!("OAuth2 user info request failed: {}", e)))?;
 
-    if !response.is_success() {
+    if !response.status().is_success() {
         return Err(McpError::InvalidRequest(format!(
             "OAuth2 token rejected by user info endpoint (status {})",
             response.status().as_u16()
         )));
     }
 
-    let claims: serde_json::Value = response
-        .json()
-        .map_err(|_| McpError::InvalidRequest("Invalid OAuth2 user info response body".into()))?;
+    let claims = read_json_capped(response).await?;
 
     let subject = claims.get("sub").and_then(|v| v.as_str()).map(String::from);
     let scopes = extract_scopes(&claims, "scope");
@@ -865,22 +1157,18 @@ async fn validate_oauth2_via_userinfo(
 /// POSTs `token=<token>` as a form to the introspection endpoint,
 /// authenticating with the configured client credentials (HTTP Basic) when
 /// present. The token is accepted only if the endpoint returns a JSON body
-/// with `"active": true`. Any transport error, timeout, non-success status,
-/// or malformed body fails closed.
+/// with `"active": true` (and, when present, an `exp` in the future). Any
+/// transport error, timeout, redirect, non-success status, or malformed body
+/// fails closed.
 async fn validate_oauth2_via_introspection(
     url: &str,
     token: &str,
     auth: &OAuth2Auth,
 ) -> Result<McpAuthContext> {
-    let mut request = oauth2_http_client()
+    let mut request = auth
+        .client()?
         .post(url)
-        .form(&[("token", token), ("token_type_hint", "access_token")])
-        .map_err(|e| {
-            McpError::InvalidRequest(format!(
-                "failed to build OAuth2 introspection request to {}: {}",
-                url, e
-            ))
-        })?;
+        .form(&[("token", token), ("token_type_hint", "access_token")]);
 
     // RFC 7662 requires the caller to authenticate; use HTTP Basic with the
     // configured client credentials when available.
@@ -895,7 +1183,7 @@ async fn validate_oauth2_via_introspection(
         ))
     })?;
 
-    if !response.is_success() {
+    if !response.status().is_success() {
         return Err(McpError::InvalidRequest(format!(
             "OAuth2 introspection endpoint {} returned status {}",
             url,
@@ -903,12 +1191,7 @@ async fn validate_oauth2_via_introspection(
         )));
     }
 
-    let body: serde_json::Value = response.json().map_err(|_| {
-        McpError::InvalidRequest(format!(
-            "Invalid OAuth2 introspection response body from {}",
-            url
-        ))
-    })?;
+    let body = read_json_capped(response).await?;
 
     // RFC 7662: only an explicit `"active": true` means the token is valid.
     if body.get("active").and_then(|v| v.as_bool()) != Some(true) {
@@ -917,6 +1200,7 @@ async fn validate_oauth2_via_introspection(
             url
         )));
     }
+    remaining_token_lifetime(&body)?;
 
     let subject = body
         .get("sub")
@@ -1068,7 +1352,10 @@ mod tests {
         let result = authenticate_api_token(&auth, &headers).await;
         assert!(result.is_ok());
         let ctx = result.unwrap();
-        assert_eq!(ctx.subject, Some("api-token:1234567é".to_string()));
+        assert_eq!(
+            ctx.subject,
+            Some(format!("api-token:{}", token_fingerprint(token)))
+        );
     }
 
     #[tokio::test]
@@ -1134,8 +1421,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_auth_allows_all() {
-        let config = McpAuthConfig::none();
+    async fn test_insecure_none_allows_all() {
+        let config = McpAuthConfig::insecure_none();
         let headers = std::collections::HashMap::new();
 
         let result = authenticate(&config, &headers, "tools/call").await;
@@ -1145,7 +1432,7 @@ mod tests {
     /// Mint a signed HS256 JWT via armature-jwt, carrying an `exp` claim
     /// `seconds_from_now` seconds in the future (negative for already-expired).
     fn mint_jwt(secret: &str, sub: &str, scope: &str, seconds_from_now: i64) -> String {
-        let config = armature_jwt::JwtConfig::new(secret.to_string());
+        let config = armature_jwt::JwtConfig::new(secret.to_string()).unwrap();
         let manager = armature_jwt::JwtManager::new(config).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1164,8 +1451,13 @@ mod tests {
         // JwtAuth is configured with the correct secret, but the token is
         // signed with a different one. This must NOT be accepted just
         // because the payload happens to decode to well-formed JSON.
-        let auth = JwtAuth::new().with_secret("correct-secret");
-        let forged = mint_jwt("wrong-secret", "attacker", "mcp:read mcp:write", 3600);
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
+        let forged = mint_jwt(
+            "Pm7Kd2Vx9Qa4Wn1Ej6Ru3Ty8Bh5Lc0Gz",
+            "attacker",
+            "mcp:read mcp:write",
+            3600,
+        );
 
         let result = authenticate_jwt(&auth, &bearer_headers(&forged)).await;
         assert!(
@@ -1176,10 +1468,15 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_auth_accepts_valid_signature_and_enforces_exp() {
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         // Correctly signed, unexpired token -> accepted with the right claims.
-        let valid = mint_jwt("correct-secret", "user-42", "mcp:read", 3600);
+        let valid = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            3600,
+        );
         let ctx = authenticate_jwt(&auth, &bearer_headers(&valid))
             .await
             .expect("correctly signed, unexpired token should be accepted");
@@ -1188,7 +1485,12 @@ mod tests {
         assert_eq!(ctx.auth_method, "jwt");
 
         // Correctly signed but expired token -> rejected.
-        let expired = mint_jwt("correct-secret", "user-42", "mcp:read", -3600);
+        let expired = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            -3600,
+        );
         let result = authenticate_jwt(&auth, &bearer_headers(&expired)).await;
         assert!(result.is_err(), "an expired token must be rejected");
     }
@@ -1222,7 +1524,7 @@ mod tests {
         // declares no signature algorithm and carries an empty signature
         // segment. A JwtAuth configured for HS256 must never accept this,
         // no matter how well-formed the claims are.
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1253,7 +1555,7 @@ mod tests {
         // a different algorithm (RS256). This must be rejected even before
         // signature verification is attempted - accepting it would open the
         // door to classic HMAC/RSA algorithm-confusion attacks.
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1287,8 +1589,13 @@ mod tests {
         // that cached manager without capturing stale/wrong key material, so
         // two sequential authentications of the same valid token must both
         // succeed and produce identical claims.
-        let auth = JwtAuth::new().with_secret("correct-secret");
-        let token = mint_jwt("correct-secret", "user-42", "mcp:read", 3600);
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
+        let token = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            3600,
+        );
 
         let first = authenticate_jwt(&auth, &bearer_headers(&token))
             .await
@@ -1586,7 +1893,7 @@ mod tests {
         // Force the cached entry to be expired by rewriting its expiry into the
         // past (the field is private but reachable from the in-module test).
         {
-            let key = hash_token("aging-token");
+            let key = sha256_token("aging-token");
             let mut map = auth.cache.lock().unwrap();
             let entry = map.get_mut(&key).expect("token should be cached");
             entry.1 = Instant::now() - Duration::from_secs(1);
@@ -1631,5 +1938,199 @@ mod tests {
         // Initialize should work without auth by default
         let result = authenticate(&config, &headers, "initialize").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_token_gets_configured_scopes_not_wildcard() {
+        // H13: API tokens used to be granted `*`, which satisfied every
+        // per-tool scope check. They must carry exactly what is configured.
+        let auth = ApiTokenAuth::new()
+            .add_token("plain-token")
+            .add_token_with_scopes("reader-token", ["mcp:read"]);
+
+        let plain = authenticate_api_token(&auth, &bearer_headers("plain-token"))
+            .await
+            .unwrap();
+        assert!(plain.scopes.is_empty());
+        assert!(!plain.has_scope("mcp:admin"));
+
+        let reader = authenticate_api_token(&auth, &bearer_headers("reader-token"))
+            .await
+            .unwrap();
+        assert_eq!(reader.scopes, vec!["mcp:read".to_string()]);
+        assert!(!reader.has_scope("mcp:admin"));
+    }
+
+    #[tokio::test]
+    async fn api_token_granted_scopes_apply_and_required_scopes_enforced() {
+        let auth = ApiTokenAuth::new()
+            .with_tokens(["t1"])
+            .with_granted_scopes(["mcp:read"])
+            .with_scopes(["mcp:write"]);
+        assert!(
+            authenticate_api_token(&auth, &bearer_headers("t1"))
+                .await
+                .is_err(),
+            "required scope not granted must reject"
+        );
+
+        let auth = auth.with_granted_scopes(["mcp:read", "mcp:write"]);
+        let ctx = authenticate_api_token(&auth, &bearer_headers("t1"))
+            .await
+            .unwrap();
+        assert!(ctx.has_all_scopes(&["mcp:read".into(), "mcp:write".into()]));
+    }
+
+    #[tokio::test]
+    async fn api_token_subject_does_not_leak_token_prefix() {
+        let auth = ApiTokenAuth::new().with_tokens(["supersecret-token-value"]);
+        let ctx = authenticate_api_token(&auth, &bearer_headers("supersecret-token-value"))
+            .await
+            .unwrap();
+        let subject = ctx.subject.unwrap();
+        assert!(!subject.contains("supersec"), "subject leaked: {subject}");
+    }
+
+    #[test]
+    fn scope_checks_per_tool_resource_prompt() {
+        let config = McpAuthConfig::api_token(ApiTokenAuth::new())
+            .require_tool_scopes("delete_user", ["mcp:admin"])
+            .require_resource_scopes("file:///secret", ["mcp:read"])
+            .require_prompt_scopes("p", ["mcp:prompt"]);
+        let reader = McpAuthContext {
+            scopes: vec!["mcp:read".into()],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.authorize_tool(&reader, "delete_user"),
+            Err(McpError::Forbidden(_))
+        ));
+        assert!(config.authorize_tool(&reader, "unscoped_tool").is_ok());
+        assert!(config.authorize_resource(&reader, "file:///secret").is_ok());
+        assert!(matches!(
+            config.authorize_prompt(&reader, "p"),
+            Err(McpError::Forbidden(_))
+        ));
+        // The anonymous context (insecure_none / unauthenticated escape
+        // hatches) holds no scopes, so scoped items stay closed.
+        assert!(
+            config
+                .authorize_resource(&McpAuthContext::default(), "file:///secret")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let api = ApiTokenAuth::new().add_token_with_scopes("tok-SECRET-1", ["s"]);
+        let oauth = OAuth2Auth::new()
+            .with_introspection("https://idp/introspect", "cid", "client-SECRET-2")
+            .with_proxy("http://user:proxy-SECRET-3@proxy:8080");
+        let jwt = JwtAuth::new().with_secret("jwt-SECRET-4");
+        let config = McpAuthConfig::any_of(vec![
+            McpAuthMethod::ApiToken(api.clone()),
+            McpAuthMethod::OAuth2(oauth.clone()),
+            McpAuthMethod::Jwt(jwt),
+        ]);
+
+        let rendered = format!("{api:?} {oauth:?} {config:?}");
+        assert!(
+            !rendered.contains("SECRET"),
+            "Debug leaked a secret: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn oauth2_cache_key_is_sha256_of_token() {
+        let auth = OAuth2Auth::new().with_cache_ttl(300);
+        auth.cache_store("tok", &McpAuthContext::default(), None);
+        let map = auth.cache.lock().unwrap();
+        assert!(map.contains_key(&sha256_token("tok")));
+        assert_eq!(map.keys().next().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn oauth2_cache_ttl_capped_by_token_exp() {
+        let auth = OAuth2Auth::new().with_cache_ttl(3600);
+        auth.cache_store(
+            "short",
+            &McpAuthContext::default(),
+            Some(Duration::from_secs(5)),
+        );
+        let map = auth.cache.lock().unwrap();
+        let (_, expiry) = map.get(&sha256_token("short")).unwrap();
+        assert!(*expiry <= Instant::now() + Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn oauth2_introspection_expired_exp_rejected() {
+        let url = spawn_stub_server(200, r#"{"active":true,"sub":"svc","exp":1000}"#).await;
+        let auth = OAuth2Auth::new().with_introspection(url, "cid", "secret");
+        assert!(
+            authenticate_oauth2(&auth, &bearer_headers("old-token"))
+                .await
+                .is_err()
+        );
+        assert!(auth.cache.lock().unwrap().is_empty());
+    }
+
+    /// Stub that answers every request with a 302 to `location`.
+    async fn spawn_redirect_server(location: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let location = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn oauth2_userinfo_does_not_follow_redirects() {
+        use std::sync::atomic::Ordering;
+        // The redirect target would accept the token; a client that follows
+        // redirects would both leak the bearer token to it and authenticate.
+        let (target, hits) =
+            spawn_counting_stub_server(200, r#"{"sub":"user-1","scope":"mcp:read"}"#).await;
+        let redirector = spawn_redirect_server(target).await;
+        let auth = OAuth2Auth::new().with_user_info(redirector).no_cache();
+
+        assert!(
+            authenticate_oauth2(&auth, &bearer_headers("tok"))
+                .await
+                .is_err()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn oauth2_oversized_response_rejected() {
+        static BIG: OnceLock<String> = OnceLock::new();
+        let body = BIG.get_or_init(|| {
+            format!(
+                r#"{{"sub":"u","pad":"{}"}}"#,
+                "x".repeat(OAUTH2_MAX_RESPONSE_BYTES)
+            )
+        });
+        let url = spawn_stub_server(200, body.as_str()).await;
+        let auth = OAuth2Auth::new().with_user_info(url).no_cache();
+        assert!(
+            authenticate_oauth2(&auth, &bearer_headers("tok"))
+                .await
+                .is_err()
+        );
     }
 }
