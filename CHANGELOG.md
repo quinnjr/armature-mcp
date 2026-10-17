@@ -9,6 +9,14 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Changed
+
+- Adapted to `armature-jwt`'s hardened API: JWT auth builds its HMAC config
+  with the fallible `JwtConfig::new` (weak secrets are rejected as an
+  invalid auth configuration), uses `JwtConfig::with_key_pair` for verify-only
+  public-key algorithms, and authenticates requests with `verify_access`, so a
+  refresh token can no longer be presented as an access token.
+
 ### Security
 
 - **MCP is no longer unauthenticated by default (H13).** `McpAuthConfig`, `McpConfig`, `McpService` and `McpController` have no default; authentication must be chosen explicitly. Running without authentication requires `McpAuthConfig::insecure_none()`, which logs a warning.

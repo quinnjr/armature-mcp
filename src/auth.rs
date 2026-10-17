@@ -870,16 +870,16 @@ fn get_or_build_jwt_manager(auth: &JwtAuth) -> Result<&armature_jwt::JwtManager>
             let secret = auth.secret.clone().ok_or_else(|| {
                 McpError::InvalidRequest("JWT auth is missing a configured secret".into())
             })?;
-            armature_jwt::JwtConfig::new(secret).with_algorithm(algorithm)
+            armature_jwt::JwtConfig::new(secret)
+                .map_err(|e| McpError::InvalidRequest(format!("Invalid JWT secret: {e}")))?
+                .with_algorithm(algorithm)
         }
         _ => {
             let public_key = auth.public_key.clone().ok_or_else(|| {
                 McpError::InvalidRequest("JWT auth is missing a configured public key".into())
             })?;
-            let mut config = armature_jwt::JwtConfig::new(String::new()).with_algorithm(algorithm);
-            config.secret = None;
-            config.public_key = Some(public_key);
-            config
+            // Verify-only: no private key is needed (or held).
+            armature_jwt::JwtConfig::with_key_pair(String::new(), public_key, algorithm)
         }
     };
 
@@ -939,8 +939,10 @@ async fn authenticate_jwt(
     // on every single request.
     let manager = get_or_build_jwt_manager(auth)?;
 
+    // `verify_access` (not `verify`): a refresh token minted by the same
+    // issuer must not authenticate a request.
     let claims: serde_json::Value = manager
-        .verify(token)
+        .verify_access(token)
         .map_err(|e| McpError::InvalidRequest(format!("JWT verification failed: {e}")))?;
 
     // Extract subject
@@ -1430,7 +1432,7 @@ mod tests {
     /// Mint a signed HS256 JWT via armature-jwt, carrying an `exp` claim
     /// `seconds_from_now` seconds in the future (negative for already-expired).
     fn mint_jwt(secret: &str, sub: &str, scope: &str, seconds_from_now: i64) -> String {
-        let config = armature_jwt::JwtConfig::new(secret.to_string());
+        let config = armature_jwt::JwtConfig::new(secret.to_string()).unwrap();
         let manager = armature_jwt::JwtManager::new(config).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1449,8 +1451,13 @@ mod tests {
         // JwtAuth is configured with the correct secret, but the token is
         // signed with a different one. This must NOT be accepted just
         // because the payload happens to decode to well-formed JSON.
-        let auth = JwtAuth::new().with_secret("correct-secret");
-        let forged = mint_jwt("wrong-secret", "attacker", "mcp:read mcp:write", 3600);
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
+        let forged = mint_jwt(
+            "Pm7Kd2Vx9Qa4Wn1Ej6Ru3Ty8Bh5Lc0Gz",
+            "attacker",
+            "mcp:read mcp:write",
+            3600,
+        );
 
         let result = authenticate_jwt(&auth, &bearer_headers(&forged)).await;
         assert!(
@@ -1461,10 +1468,15 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_auth_accepts_valid_signature_and_enforces_exp() {
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         // Correctly signed, unexpired token -> accepted with the right claims.
-        let valid = mint_jwt("correct-secret", "user-42", "mcp:read", 3600);
+        let valid = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            3600,
+        );
         let ctx = authenticate_jwt(&auth, &bearer_headers(&valid))
             .await
             .expect("correctly signed, unexpired token should be accepted");
@@ -1473,7 +1485,12 @@ mod tests {
         assert_eq!(ctx.auth_method, "jwt");
 
         // Correctly signed but expired token -> rejected.
-        let expired = mint_jwt("correct-secret", "user-42", "mcp:read", -3600);
+        let expired = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            -3600,
+        );
         let result = authenticate_jwt(&auth, &bearer_headers(&expired)).await;
         assert!(result.is_err(), "an expired token must be rejected");
     }
@@ -1507,7 +1524,7 @@ mod tests {
         // declares no signature algorithm and carries an empty signature
         // segment. A JwtAuth configured for HS256 must never accept this,
         // no matter how well-formed the claims are.
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1538,7 +1555,7 @@ mod tests {
         // a different algorithm (RS256). This must be rejected even before
         // signature verification is attempted - accepting it would open the
         // door to classic HMAC/RSA algorithm-confusion attacks.
-        let auth = JwtAuth::new().with_secret("correct-secret");
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1572,8 +1589,13 @@ mod tests {
         // that cached manager without capturing stale/wrong key material, so
         // two sequential authentications of the same valid token must both
         // succeed and produce identical claims.
-        let auth = JwtAuth::new().with_secret("correct-secret");
-        let token = mint_jwt("correct-secret", "user-42", "mcp:read", 3600);
+        let auth = JwtAuth::new().with_secret("Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab");
+        let token = mint_jwt(
+            "Zq3v9Lw2Rk8Xp1Tn6Yb4Hc7Md0Fs5Gj2Ab",
+            "user-42",
+            "mcp:read",
+            3600,
+        );
 
         let first = authenticate_jwt(&auth, &bearer_headers(&token))
             .await
