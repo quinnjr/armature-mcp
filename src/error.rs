@@ -35,6 +35,11 @@ pub enum McpError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    /// The caller is authenticated but lacks a scope the tool, resource or
+    /// prompt requires.
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl McpError {
@@ -51,6 +56,7 @@ impl McpError {
             McpError::PromptNotFound(_) => -32002,
             McpError::ToolExecutionFailed(_) => -32000,
             McpError::Serialization(_) => -32700,
+            McpError::Forbidden(_) => -32003,
         }
     }
 }

@@ -16,13 +16,25 @@
 //!
 //! ## 1. Add MCP to your application
 //!
+//! Authentication is required configuration — there is no unauthenticated
+//! default. Per-tool scopes are enforced against the authenticated caller.
+//!
 //! ```ignore
-//! use armature_mcp::McpRouterExt;
+//! use armature_mcp::{ApiTokenAuth, McpAuthConfig, McpRouterExt};
 //!
 //! let router = Router::new()
-//!     .with_mcp()  // Adds /mcp endpoint
+//!     .with_mcp_auth(  // Adds the /mcp endpoints
+//!         McpAuthConfig::api_token(
+//!             ApiTokenAuth::new().add_token_with_scopes(token, ["mcp:read"]),
+//!         )
+//!         .require_tool_scopes("get_weather", ["mcp:read"]),
+//!     )
 //!     .get("/", home_handler);
 //! ```
+//!
+//! For local development only, `McpAuthConfig::insecure_none()` disables
+//! authentication (and logs a warning). The endpoints also refuse requests
+//! whose `Origin` or `Host` header is not allowlisted (see [`McpConfig`]).
 //!
 //! ## 2. Define MCP tools with the `#[mcp]` attribute
 //!
@@ -63,7 +75,7 @@
 //!
 //! # Protocol Endpoints
 //!
-//! When using `with_mcp()`, the following endpoints are added:
+//! When using `with_mcp_auth()` / `with_mcp_config()`, the following endpoints are added:
 //!
 //! | Method | Path | Description |
 //! |--------|------|-------------|
