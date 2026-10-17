@@ -13,23 +13,20 @@ use std::sync::Arc;
 /// This controller handles JSON-RPC 2.0 requests for the Model Context Protocol,
 /// enabling AI clients like Cursor and Claude to discover and invoke tools.
 ///
+/// Every handler first validates the `Origin` and `Host` headers against the
+/// [`McpConfig`] allowlists (DNS-rebinding protection, `403` on mismatch) and
+/// then authenticates. There is no default controller: authentication must be
+/// configured explicitly.
+///
 /// # Usage
 ///
-/// ```ignore
-/// use armature_mcp::{McpController, McpConfig};
-/// use armature::{module, Application};
+/// ```
+/// use armature_mcp::{ApiTokenAuth, McpAuthConfig, McpConfig, McpController};
 ///
-/// #[module(
-///     controllers: [McpController]
-/// )]
-/// struct AppModule;
-///
-/// #[tokio::main]
-/// async fn main() {
-///     Application::create::<AppModule>()
-///         .listen("127.0.0.1:3000")
-///         .await;
-/// }
+/// let controller = McpController::with_config(McpConfig::new(McpAuthConfig::api_token(
+///     ApiTokenAuth::new().add_token_with_scopes("secret-token", ["mcp:read"]),
+/// )));
+/// # let _ = controller;
 /// ```
 #[derive(Clone)]
 pub struct McpController {
@@ -37,14 +34,7 @@ pub struct McpController {
 }
 
 impl McpController {
-    /// Create a new MCP controller with default configuration
-    pub fn new() -> Self {
-        Self {
-            service: Arc::new(McpService::new()),
-        }
-    }
-
-    /// Create a new MCP controller with custom configuration
+    /// Create a new MCP controller
     pub fn with_config(config: McpConfig) -> Self {
         Self {
             service: Arc::new(McpService::with_config(config)),
@@ -56,8 +46,25 @@ impl McpController {
         &self.service
     }
 
+    /// Refuse requests whose `Origin` or `Host` is not allowed by the
+    /// configuration (`403 Forbidden`). Browsers always send both on a
+    /// cross-origin or DNS-rebound request, so this closes the
+    /// browser-to-local-MCP-server path the MCP transport spec warns about.
+    fn check_origin_and_host(&self, req: &HttpRequest) -> Result<(), Error> {
+        let config = self.service.config();
+        if !config.origin_allowed(req.headers.get("origin")) {
+            return Err(Error::Forbidden("Origin not allowed".to_string()));
+        }
+        if !config.host_allowed(req.headers.get("host")) {
+            return Err(Error::Forbidden("Host not allowed".to_string()));
+        }
+        Ok(())
+    }
+
     /// Handle POST /mcp - JSON-RPC endpoint
     pub async fn handle_request(&self, req: HttpRequest) -> Result<HttpResponse, Error> {
+        self.check_origin_and_host(&req)?;
+
         // The MCP auth chain is HashMap-typed throughout; convert the request's
         // HeaderMap to a HashMap at this boundary.
         let headers: std::collections::HashMap<String, String> = req.headers.clone().into();
@@ -89,6 +96,7 @@ impl McpController {
     /// Maps an authentication failure to `Error::Unauthorized` (HTTP 401),
     /// matching how the rest of the framework reports auth failures.
     async fn authenticate_get(&self, req: &HttpRequest, jsonrpc_method: &str) -> Result<(), Error> {
+        self.check_origin_and_host(req)?;
         let headers: std::collections::HashMap<String, String> = req.headers.clone().into();
         self.service
             .authenticate(&headers, jsonrpc_method)
@@ -170,17 +178,8 @@ impl McpController {
     }
 }
 
-impl Default for McpController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Extension trait to add MCP routes to a Router
 pub trait McpRouterExt {
-    /// Add MCP endpoint routes to the router (no authentication)
-    fn with_mcp(self) -> Self;
-
     /// Add MCP endpoint routes with authentication
     ///
     /// # Example
@@ -209,12 +208,8 @@ pub trait McpRouterExt {
 }
 
 impl McpRouterExt for armature_core::routing::Router {
-    fn with_mcp(self) -> Self {
-        self.with_mcp_config(McpConfig::default())
-    }
-
     fn with_mcp_auth(self, auth: McpAuthConfig) -> Self {
-        self.with_mcp_config(McpConfig::default().with_auth(auth))
+        self.with_mcp_config(McpConfig::new(auth))
     }
 
     fn with_mcp_config(mut self, config: McpConfig) -> Self {
@@ -337,7 +332,7 @@ mod tests {
     /// parser was handed the emptied legacy Vec. This pins the fix.
     #[tokio::test]
     async fn wire_body_is_read_not_the_empty_legacy_vec() {
-        let controller = McpController::new();
+        let controller = McpController::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
         let resp = controller
             .handle_request(post_request_from_wire(
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
@@ -364,7 +359,7 @@ mod tests {
     /// that means an empty 204, not a `-32601` JSON body.
     #[tokio::test]
     async fn post_notification_returns_204_with_no_body() {
-        let controller = McpController::new();
+        let controller = McpController::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
 
         let resp = controller
             .handle_request(post_request(
@@ -379,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_request_with_id_still_returns_a_json_body() {
-        let controller = McpController::new();
+        let controller = McpController::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
 
         let resp = controller
             .handle_request(post_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
@@ -392,7 +387,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_list_tools_includes_dynamically_registered_provider() {
-        let service = McpService::new().with_tool_provider(Arc::new(DynToolProvider));
+        let service = McpService::with_config(McpConfig::new(McpAuthConfig::insecure_none()))
+            .with_tool_provider(Arc::new(DynToolProvider));
         let controller = controller_wrapping(service);
 
         let resp = controller
@@ -417,7 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_info_tools_count_includes_dynamically_registered_provider() {
-        let service = McpService::new().with_tool_provider(Arc::new(DynToolProvider));
+        let service = McpService::with_config(McpConfig::new(McpAuthConfig::insecure_none()))
+            .with_tool_provider(Arc::new(DynToolProvider));
         let controller = controller_wrapping(service);
 
         let resp = controller.handle_info(get_request("/mcp")).await.unwrap();
@@ -442,7 +439,7 @@ mod tests {
     async fn get_endpoints_reject_requests_without_valid_auth() {
         use crate::auth::{ApiTokenAuth, McpAuthConfig};
 
-        let config = McpConfig::default().with_auth(McpAuthConfig::api_token(
+        let config = McpConfig::new(McpAuthConfig::api_token(
             ApiTokenAuth::new().with_tokens(vec!["secret-token"]),
         ));
         let service = McpService::with_config(config).with_tool_provider(Arc::new(DynToolProvider));
@@ -482,7 +479,7 @@ mod tests {
     async fn get_endpoints_accept_requests_with_valid_auth() {
         use crate::auth::{ApiTokenAuth, McpAuthConfig};
 
-        let config = McpConfig::default().with_auth(McpAuthConfig::api_token(
+        let config = McpConfig::new(McpAuthConfig::api_token(
             ApiTokenAuth::new().with_tokens(vec!["secret-token"]),
         ));
         let service = McpService::with_config(config).with_tool_provider(Arc::new(DynToolProvider));
@@ -515,5 +512,52 @@ mod tests {
             .handle_info(good_req("/mcp"))
             .await
             .expect("valid token should be accepted for GET /mcp");
+    }
+
+    /// H13: DNS-rebinding / cross-origin protection. A browser on an
+    /// attacker origin (or a rebound host name) must be refused before
+    /// authentication even runs; non-browser requests without `Origin` pass.
+    #[tokio::test]
+    async fn origin_and_host_are_validated_on_every_endpoint() {
+        let controller = McpController::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+        let mut cross_origin = post_request(ping);
+        cross_origin
+            .headers
+            .insert("Origin", "https://evil.example".to_string());
+        let err = controller.handle_request(cross_origin).await.unwrap_err();
+        assert_eq!(err.status_code(), 403);
+
+        let mut rebound = post_request(ping);
+        rebound
+            .headers
+            .insert("Host", "attacker.example:3000".to_string());
+        let err = controller.handle_request(rebound).await.unwrap_err();
+        assert_eq!(err.status_code(), 403);
+
+        let mut rebound_get = get_request("/mcp/tools");
+        rebound_get
+            .headers
+            .insert("Host", "attacker.example".to_string());
+        let err = controller.handle_list_tools(rebound_get).await.unwrap_err();
+        assert_eq!(err.status_code(), 403);
+
+        let mut local = post_request(ping);
+        local.headers.insert("Host", "localhost:3000".to_string());
+        assert_eq!(controller.handle_request(local).await.unwrap().status, 200);
+
+        let controller = McpController::with_config(
+            McpConfig::new(McpAuthConfig::insecure_none())
+                .with_allowed_origins(["https://app.example"]),
+        );
+        let mut allowed = post_request(ping);
+        allowed
+            .headers
+            .insert("Origin", "https://app.example".to_string());
+        assert_eq!(
+            controller.handle_request(allowed).await.unwrap().status,
+            200
+        );
     }
 }

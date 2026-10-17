@@ -8,7 +8,10 @@
 //! result.
 
 use armature_mcp::mcp;
-use armature_mcp::{ContentItem, JsonRpcRequest, McpService, ToolCallResult, ToolsListResult};
+use armature_mcp::{
+    ContentItem, JsonRpcRequest, McpAuthConfig, McpConfig, McpService, ToolCallResult,
+    ToolsListResult,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -31,7 +34,7 @@ fn no_headers() -> HashMap<String, String> {
 
 #[tokio::test]
 async fn mcp_attribute_tool_appears_in_tools_list() {
-    let service = McpService::new();
+    let service = McpService::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
     let request = JsonRpcRequest::new("tools/list");
 
     let response = service
@@ -56,7 +59,7 @@ async fn mcp_attribute_tool_appears_in_tools_list() {
 
 #[tokio::test]
 async fn mcp_attribute_tool_dispatches_via_tools_call() {
-    let service = McpService::new();
+    let service = McpService::with_config(McpConfig::new(McpAuthConfig::insecure_none()));
     let request = JsonRpcRequest::new("tools/call").with_params(serde_json::json!({
         "name": "greet_attr_tool",
         "arguments": { "name": "Ada" }
