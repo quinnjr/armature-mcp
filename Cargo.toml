@@ -17,7 +17,7 @@ keywords = ["mcp", "ai", "llm", "tools", "armature"]
 categories = ["web-programming", "development-tools"]
 
 [dependencies]
-armature-core = { version = "0.12" }
+armature-core = { version = "0.13" }
 armature-proc-macro = { version = "0.6" }
 armature-jwt = { version = "0.6" }
 
